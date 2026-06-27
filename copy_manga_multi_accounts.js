@@ -735,7 +735,7 @@ class CopyManga extends ComicSource {
                             s.offset += result.list.length;
                         }
                         // 避免同时向 API 发多个不同 token 的请求，可能混淆 session
-                        await new Promise(r => setTimeout(r, 100));
+                        await new Promise(r => setTimeout(r, 300));
                     } catch (e) {
                         UI.showMessage(`${s.name}: ${e}`);
                         if (typeof e === 'string' && e.includes('Login expired')) {
