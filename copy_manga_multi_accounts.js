@@ -4,7 +4,7 @@ class CopyManga extends ComicSource {
 
     key = "copy_manga"
 
-    version = "1.4.2"
+    version = "1.4.1"
 
     minAppVersion = "1.6.0"
 
@@ -604,7 +604,7 @@ class CopyManga extends ComicSource {
         },
 
         loadComics: async (page, folder) => {
-            if (folder === "-1") {
+            if (String(folder) === "-1") {
                 return this._loadAllFavorites(page);
             }
             let token = this.loadData(`account_token_${folder}`);
@@ -796,11 +796,11 @@ class CopyManga extends ComicSource {
         if (allExhausted) {
             total = this._merged.length;
         } else {
-            let maxAccountTotal = 0;
+            let sumAccountTotal = 0;
             for (let s of this._mergeState) {
-                if (s.total > maxAccountTotal) maxAccountTotal = s.total;
+                if (s.total > 0) sumAccountTotal += s.total;
             }
-            total = maxAccountTotal > 0 ? maxAccountTotal : this._merged.length + 30;
+            total = sumAccountTotal > 0 ? sumAccountTotal : this._merged.length + 30;
         }
 
         return {
