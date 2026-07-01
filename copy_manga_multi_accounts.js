@@ -176,8 +176,7 @@ class CopyManga extends ComicSource {
         this.refreshAppApi()
     }
 
-    /// account
-    /// set this to null to desable account feature
+    /// 主账号（用于评论、看漫画）
     account = {
         login: async (account, pwd) => {
             let salt = randomInt(1000, 9999)
@@ -200,10 +199,7 @@ class CopyManga extends ComicSource {
             }
         },
         logout: () => {
-            let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
-            for (let i = 0; i < accounts.length; i++) {
-                this.deleteData(`account_token_${i}`);
-            }
+            this.deleteData('account_token_0');
         },
         registerWebsite: null
     }
@@ -557,9 +553,10 @@ class CopyManga extends ComicSource {
         loadFolders: async (comicId) => {
             let folders = new Map();
             folders.set("-1", "全部");
-            let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
-            for (let i = 0; i < accounts.length; i++) {
-                folders.set(String(i), accounts[i].name);
+            folders.set("0", "主号");
+            let subAccounts = JSON.parse(this.loadSetting('sub_accounts') || '[]');
+            for (let i = 0; i < subAccounts.length; i++) {
+                folders.set(String(i + 1), subAccounts[i].name);
             }
 
             let favorited = [];
@@ -662,114 +659,176 @@ class CopyManga extends ComicSource {
     }
 
     async _checkFavoriteAccounts(comicId) {
-        let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
-        let checks = accounts.map((_, i) => (async () => {
-            let token = this.loadData(`account_token_${i}`);
-            if (!token) return null;
-            try {
-                let headers = this._headersForToken(token);
-                let res = await Network.get(`${this.apiUrl}/api/v3/comic2/${comicId}/query`, headers);
-                if (res.status === 200) {
-                    let data = JSON.parse(res.body);
-                    if (data.results.collect != null) {
-                        return String(i);
+        let subAccounts = JSON.parse(this.loadSetting('sub_accounts') || '[]');
+        // 主号 (index 0) + 附属号 (index 1..n)
+        let totalAccounts = 1 + subAccounts.length;
+        let checks = [];
+        for (let i = 0; i < totalAccounts; i++) {
+            checks.push((async () => {
+                let token = this.loadData(`account_token_${i}`);
+                if (!token) return null;
+                try {
+                    let headers = this._headersForToken(token);
+                    let res = await Network.get(`${this.apiUrl}/api/v3/comic2/${comicId}/query`, headers);
+                    if (res.status === 200) {
+                        let data = JSON.parse(res.body);
+                        if (data.results.collect != null) {
+                            return String(i);
+                        }
                     }
-                }
-            } catch (e) {}
-            return null;
-        })());
+                } catch (e) {}
+                return null;
+            })());
+        }
         let results = await Promise.all(checks);
         return results.filter(r => r !== null);
     }
 
     _clearMergeState() {
-        this._mergeState = null;
-        this._merged = null;
+        this._streams = null;
+        this._pageCache = null;
         this._seen = null;
     }
 
-    _initMergeState() {
-        let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
-        let tokens = [];
-        for (let i = 0; i < accounts.length; i++) {
-            let t = this.loadData(`account_token_${i}`);
-            if (t) tokens.push({ token: t, name: accounts[i].name });
+    async _initStreams() {
+        let streams = [];
+        // 主号
+        let mainToken = this.loadData('account_token_0');
+        if (mainToken) {
+            streams.push({
+                name: '主号',
+                token: mainToken,
+                eliminated: 0,
+                total: -1,
+            });
         }
-        this._mergeState = tokens.map(t => ({
-            name: t.name,
-            token: t.token,
-            buffer: [],
-            consumed: 0,
-            offset: 0,
-            total: -1,
-            exhausted: false,
-        }));
-        this._merged = [];
+        // 附属号
+        let subAccounts = JSON.parse(this.loadSetting('sub_accounts') || '[]');
+        for (let i = 0; i < subAccounts.length; i++) {
+            let t = this.loadData(`account_token_${i + 1}`);
+            if (!t) continue;
+            streams.push({
+                name: subAccounts[i].name,
+                token: t,
+                eliminated: 0,
+                total: -1,
+            });
+        }
+        this._pageCache = {};
         this._seen = new Set();
+        for (let s of streams) {
+            try {
+                let result = await this._fetchFavoritesPage(s.token, 0, '-datetime_updated', s.name);
+                s.total = result.total;
+                if (!this._pageCache[s.token]) this._pageCache[s.token] = {};
+                this._pageCache[s.token][1] = result.list;
+            } catch (e) {
+                UI.showMessage(`${s.name}: ${e}`);
+                s.total = 0;
+            }
+            await new Promise(r => setTimeout(r, 300));
+        }
+        this._streams = streams;
+    }
+
+    /**
+     * 获取某账号第 pageNo 页（1-based），自动缓存
+     */
+    async _getPage(token, pageNo) {
+        if (!this._pageCache[token]) this._pageCache[token] = {};
+        let cached = this._pageCache[token][pageNo];
+        if (cached) return cached;
+        let result = await this._fetchFavoritesPage(token, (pageNo - 1) * 30, '-datetime_updated', '');
+        this._pageCache[token][pageNo] = result.list;
+        return result.list;
+    }
+
+    /**
+     * 比例分配步长分治排除法：在多个降序数组中定位第 K 大元素
+     * @param {Array} streams - [{ eliminated, total, token }]
+     * @param {number} k - 1-based 全局目标排名
+     * @returns {Object|null} 第 K 大元素，超出范围返回 null
+     */
+    async _proportionalFindKth(streams, k) {
+        const PAGE_SIZE = 30;
+
+        while (true) {
+            let active = streams.filter(s => s.total > 0 && s.eliminated < s.total);
+            if (active.length === 0) return null;
+
+            let M = active.length;
+
+            if (k === 1 || k - 1 < M) {
+                let best = null;
+                let bestDate = '';
+                for (let s of active) {
+                    let idx = s.eliminated;
+                    let page = await this._getPage(s.token, Math.floor(idx / PAGE_SIZE) + 1);
+                    let item = page[idx % PAGE_SIZE];
+                    let dt = item.comic.datetime_updated || '';
+                    if (!best || dt > bestDate) { best = { stream: s, item }; bestDate = dt; }
+                }
+                best.stream.eliminated++;
+                if (k === 1) return best.item;
+                k--;
+                continue;
+            }
+
+            let totalRemaining = active.reduce((sum, s) => sum + s.total - s.eliminated, 0);
+            let E = k - 1 - M;
+
+            for (let s of active) {
+                let remaining = s.total - s.eliminated;
+                let bonus = Math.floor(E * remaining / totalRemaining);
+                s._step = Math.min(remaining, 1 + bonus);
+                s._probeIdx = s.eliminated + s._step - 1;
+            }
+
+            for (let s of active) {
+                await this._getPage(s.token, Math.floor(s._probeIdx / PAGE_SIZE) + 1);
+                await new Promise(r => setTimeout(r, 300));
+            }
+
+            let bestStream = null;
+            let bestDate = '';
+            for (let s of active) {
+                let pageNo = Math.floor(s._probeIdx / PAGE_SIZE) + 1;
+                let item = this._pageCache[s.token][pageNo][s._probeIdx % PAGE_SIZE];
+                let dt = item.comic.datetime_updated || '';
+                if (!bestStream || dt > bestDate) { bestStream = s; bestDate = dt; }
+            }
+
+            bestStream.eliminated += bestStream._step;
+            k -= bestStream._step;
+        }
     }
 
     async _loadAllFavorites(page) {
         if (page === 1) {
             this._clearMergeState();
         }
-        let reinit = !this._mergeState;
-        if (reinit) {
-            this._initMergeState();
-        }
-        let target = page * 30;
-
-        while (this._merged.length < target) {
-            // 为每个未耗尽的流确保缓冲区：内部剩 ≤1 个元素时自动加载下一页
-            for (let s of this._mergeState) {
-                if (s.exhausted) continue;
-                if (s.buffer.length - s.consumed <= 1) {
-                    try {
-                        let result = await this._fetchFavoritesPage(s.token, s.offset, '-datetime_updated', s.name);
-                        if (result.list.length === 0) {
-                            if (s.buffer.length - s.consumed <= 0) {
-                                s.exhausted = true;
-                            }
-                        } else {
-                            s.buffer.push(...result.list);
-                            s.total = result.total;
-                            s.offset += result.list.length;
-                        }
-                        // 避免同时向 API 发多个不同 token 的请求，可能混淆 session
-                        await new Promise(r => setTimeout(r, 300));
-                    } catch (e) {
-                        UI.showMessage(`${s.name}: ${e}`);
-                        if (typeof e === 'string' && e.includes('Login expired')) {
-                            s.exhausted = true;
-                        }
-                    }
-                }
-            }
-
-            // 比较各流顶部元素 datetime_updated（YYYY-MM-DD 格式天然支持字符串字典序比较），选出最新
-            let bestStream = null;
-            let bestDate = '';
-            for (let s of this._mergeState) {
-                if (s.exhausted || s.consumed >= s.buffer.length) continue;
-                let dt = s.buffer[s.consumed].comic.datetime_updated || '';
-                if (!bestStream || dt > bestDate) {
-                    bestStream = s;
-                    bestDate = dt;
-                }
-            }
-            if (!bestStream) break;
-
-            let item = bestStream.buffer[bestStream.consumed];
-            bestStream.consumed++;
-
-            let uuid = item.comic.uuid;
-            if (!this._seen.has(uuid)) {
-                this._seen.add(uuid);
-                this._merged.push(item);
-            }
+        if (!this._streams) {
+            await this._initStreams();
         }
 
-        let start = (page - 1) * 30;
-        let slice = this._merged.slice(start, start + 30);
+        for (let s of this._streams) {
+            s.eliminated = 0;
+        }
+
+        let skipCount = (page - 1) * 30 ;
+        if (skipCount > 0) {
+            await this._proportionalFindKth(this._streams, skipCount);
+        }
+
+        let uniqueItems = [];
+        for (let i = 0; i < 30; i++) {
+            let item = await this._proportionalFindKth(this._streams, 1);
+            if (!item) break;
+            if (!this._seen.has(item.comic.uuid)) {
+                this._seen.add(item.comic.uuid);
+                uniqueItems.push(item);
+            }
+        }
 
         function parseComic(item) {
             let comic = item.comic;
@@ -791,21 +850,12 @@ class CopyManga extends ComicSource {
             };
         }
 
-        let allExhausted = this._mergeState.every(s => s.exhausted && s.consumed >= s.buffer.length);
-        let total;
-        if (allExhausted) {
-            total = this._merged.length;
-        } else {
-            let sumAccountTotal = 0;
-            for (let s of this._mergeState) {
-                if (s.total > 0) sumAccountTotal += s.total;
-            }
-            total = sumAccountTotal > 0 ? sumAccountTotal : this._merged.length + 30;
-        }
+        let sumTotal = this._streams.reduce((s, st) => s + Math.max(0, st.total), 0);
+        let maxPage = Math.max(1, Math.ceil(sumTotal / 30));
 
         return {
-            comics: slice.map(parseComic),
-            maxPage: Math.ceil(total / 30)
+            comics: uniqueItems.map(parseComic),
+            maxPage: maxPage
         };
     }
 
@@ -1159,14 +1209,14 @@ class CopyManga extends ComicSource {
 主要用于解决拷贝单账号收藏数最多1000的缺点。
 与"拷贝漫画"源共用一个key，所以不能共存（但是共享历史记录）。
 
-• 第一个账号（索引0）：用于评论、看漫画
-• 所有账号：均用于收藏夹
+• 主账号：通过APP标准登录入口登录，用于评论、看漫画
+• 附属账号：在下方"附属账号列表"中配置，仅用于收藏合并
 
 收藏排序说明：
 受限于拷贝API，排序方式（收藏时间/阅读时间）只对单个账号收藏生效。
 "全部"视图固定按更新时间排序。
 
-账号配置格式：
+附属账号配置格式：
 [{"name":"显示名","username":"用户名","password":"密码"}]
 密码以明文存储于设置中，请注意安全。`, [{text: "知道了", callback: () => {}}]);
             }
@@ -1256,21 +1306,21 @@ class CopyManga extends ComicSource {
                 this.refreshAppApi();
             }
         },
-        accounts: {
-            title: "账号列表",
+        sub_accounts: {
+            title: "附属账号列表",
             type: "input",
-            default: "[{\"name\":\"主号\",\"username\":\"用户名1\",\"password\":\"密码1\"},{\"name\":\"小号1\",\"username\":\"用户名2\",\"password\":\"密码2\"}]",
-            description: "第一个账号用于搜索/评论，其余仅用于收藏"
+            default: "[{\"name\":\"小号1\",\"username\":\"用户名1\",\"password\":\"密码1\"}]",
+            description: "仅用于收藏合并。主账号请通过APP标准登录入口登录"
         },
-        login_all_accounts: {
-            title: "登录所有账号",
+        login_sub_accounts: {
+            title: "登录附属账号",
             type: "callback",
-            buttonText: "登录所有账号",
+            buttonText: "登录所有附属账号",
             callback: async () => {
-                let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
+                let subAccounts = JSON.parse(this.loadSetting('sub_accounts') || '[]');
                 let ok = 0;
-                for (let i = 0; i < accounts.length; i++) {
-                    let acc = accounts[i];
+                for (let i = 0; i < subAccounts.length; i++) {
+                    let acc = subAccounts[i];
                     let salt = randomInt(1000, 9999);
                     let base64 = Convert.encodeBase64(Convert.encodeUtf8(`${acc.password}-${salt}`));
                     let res = await Network.post(
@@ -1283,23 +1333,23 @@ class CopyManga extends ComicSource {
                     );
                     if (res.status === 200) {
                         let data = JSON.parse(res.body);
-                        this.saveData(`account_token_${i}`, data.results.token);
+                        this.saveData(`account_token_${i + 1}`, data.results.token);
                         ok++;
                     }
                 }
-                UI.showMessage(`登录: ${ok}/${accounts.length} 成功`);
+                UI.showMessage(`附属账号登录: ${ok}/${subAccounts.length} 成功`);
             }
         },
-        reset_accounts: {
-            title: "重置账号",
+        clear_sub_accounts: {
+            title: "清除附属账号",
             type: "callback",
-            buttonText: "清除所有账号TOKEN",
+            buttonText: "清除所有附属账号TOKEN",
             callback: () => {
-                let accounts = JSON.parse(this.loadSetting('accounts') || '[]');
-                for (let i = 0; i < accounts.length; i++) {
-                    this.deleteData(`account_token_${i}`);
+                let subAccounts = JSON.parse(this.loadSetting('sub_accounts') || '[]');
+                for (let i = 0; i < subAccounts.length; i++) {
+                    this.deleteData(`account_token_${i + 1}`);
                 }
-                UI.showMessage("已清除所有账号TOKEN");
+                UI.showMessage("已清除所有附属账号TOKEN");
             }
         },
         // version: {
