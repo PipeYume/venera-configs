@@ -785,8 +785,12 @@ class CopyManga extends ComicSource {
             }
 
             for (let s of active) {
-                await this._getPage(s.token, Math.floor(s._probeIdx / PAGE_SIZE) + 1);
-                await new Promise(r => setTimeout(r, 300));
+                let pageNo = Math.floor(s._probeIdx / PAGE_SIZE) + 1;
+                let wasCached = this._pageCache[s.token] && this._pageCache[s.token][pageNo];
+                await this._getPage(s.token, pageNo);
+                if (!wasCached) {
+                    await new Promise(r => setTimeout(r, 300));
+                }
             }
 
             let bestStream = null;
