@@ -685,9 +685,7 @@ class CopyManga extends ComicSource {
     }
 
     _clearMergeState() {
-        this._streams = null;
-        this._pageCache = null;
-        this._seen = null;
+        this._mergeState = null;
     }
 
     async _initStreams() {
@@ -714,37 +712,38 @@ class CopyManga extends ComicSource {
                 total: -1,
             });
         }
-        this._pageCache = {};
-        this._seen = new Set();
+        let pageCache = {};
+        let seen = new Set();
         for (let s of streams) {
             try {
                 let result = await this._fetchFavoritesPage(s.token, 0, '-datetime_updated', s.name);
                 s.total = result.total;
-                if (!this._pageCache[s.token]) this._pageCache[s.token] = {};
-                this._pageCache[s.token][1] = result.list;
+                if (!pageCache[s.token]) pageCache[s.token] = {};
+                pageCache[s.token][1] = result.list;
             } catch (e) {
                 UI.showMessage(`${s.name}: ${e}`);
                 s.total = 0;
             }
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 500));
         }
-        this._streams = streams;
+        this._mergeState = { streams, pageCache, seen };
     }
 
     /**
      * 获取某账号第 pageNo 页（1-based），自动缓存
      */
     async _getPage(token, pageNo) {
-        if (!this._pageCache[token]) this._pageCache[token] = {};
-        let cached = this._pageCache[token][pageNo];
+        let pc = this._mergeState.pageCache;
+        if (!pc[token]) pc[token] = {};
+        let cached = pc[token][pageNo];
         if (cached) return cached;
         let result = await this._fetchFavoritesPage(token, (pageNo - 1) * 30, '-datetime_updated', '');
-        this._pageCache[token][pageNo] = result.list;
+        pc[token][pageNo] = result.list;
         return result.list;
     }
 
     /**
-     * 比例分配步长分治排除法：在多个降序数组中定位第 K 大元素
+     * 一种针对分页访问代价高昂的多个降序流，以比例分配跳跃步长、分治排除的方式快速定位全局第 k 大元素的多路选择算法。
      * @param {Array} streams - [{ eliminated, total, token }]
      * @param {number} k - 1-based 全局目标排名
      * @returns {Object|null} 第 K 大元素，超出范围返回 null
@@ -786,10 +785,10 @@ class CopyManga extends ComicSource {
 
             for (let s of active) {
                 let pageNo = Math.floor(s._probeIdx / PAGE_SIZE) + 1;
-                let wasCached = this._pageCache[s.token] && this._pageCache[s.token][pageNo];
+                let wasCached = this._mergeState.pageCache[s.token] && this._mergeState.pageCache[s.token][pageNo];
                 await this._getPage(s.token, pageNo);
                 if (!wasCached) {
-                    await new Promise(r => setTimeout(r, 300));
+                    await new Promise(r => setTimeout(r, 500));
                 }
             }
 
@@ -797,7 +796,7 @@ class CopyManga extends ComicSource {
             let bestDate = '';
             for (let s of active) {
                 let pageNo = Math.floor(s._probeIdx / PAGE_SIZE) + 1;
-                let item = this._pageCache[s.token][pageNo][s._probeIdx % PAGE_SIZE];
+                let item = this._mergeState.pageCache[s.token][pageNo][s._probeIdx % PAGE_SIZE];
                 let dt = item.comic.datetime_updated || '';
                 if (!bestStream || dt > bestDate) { bestStream = s; bestDate = dt; }
             }
@@ -811,25 +810,25 @@ class CopyManga extends ComicSource {
         if (page === 1) {
             this._clearMergeState();
         }
-        if (!this._streams) {
+        if (!this._mergeState) {
             await this._initStreams();
         }
 
-        for (let s of this._streams) {
+        for (let s of this._mergeState.streams) {
             s.eliminated = 0;
         }
 
         let skipCount = (page - 1) * 30 ;
         if (skipCount > 0) {
-            await this._proportionalFindKth(this._streams, skipCount);
+            await this._proportionalFindKth(this._mergeState.streams, skipCount);
         }
 
         let uniqueItems = [];
         for (let i = 0; i < 30; i++) {
-            let item = await this._proportionalFindKth(this._streams, 1);
+            let item = await this._proportionalFindKth(this._mergeState.streams, 1);
             if (!item) break;
-            if (!this._seen.has(item.comic.uuid)) {
-                this._seen.add(item.comic.uuid);
+            if (!this._mergeState.seen.has(item.comic.uuid)) {
+                this._mergeState.seen.add(item.comic.uuid);
                 uniqueItems.push(item);
             }
         }
@@ -854,7 +853,7 @@ class CopyManga extends ComicSource {
             };
         }
 
-        let sumTotal = this._streams.reduce((s, st) => s + Math.max(0, st.total), 0);
+        let sumTotal = this._mergeState.streams.reduce((s, st) => s + Math.max(0, st.total), 0);
         let maxPage = Math.max(1, Math.ceil(sumTotal / 30));
 
         return {
